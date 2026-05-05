@@ -1,20 +1,16 @@
 """
 extract_features.py
 ====================
-Pipeline ekstraksi fitur audio (MFCC & Chromagram) dari SEMUA subfolder
-instrumen di input/ berdasarkan metadata CSV.
+Pipeline ekstraksi fitur audio (MFCC & Chromagram) dari struktur folder:
+  input/{instrument}/{artist}/{artist_name}-{song_title}_{instrument}.wav
 
-Subfolder yang di‑scan otomatis:
-  input/vocals, input/guitar, input/piano, input/bass,
-  input/guitar_piano, input/guitar_piano_bass, input/no_vocals
+Output di‑kelompokkan per lagu:
+  output/{artist}/{track_id}/{instrument}/extracted_features_mfcc.pkl
+  output/{artist}/{track_id}/{instrument}/extracted_features_chromagram.pkl
+  output/{artist}/{track_id}/{instrument}/extracted_features_mfcc_chroma.pkl
 
-Output di‑kelompokkan per subfolder:
-  output/bass/extracted_features_mfcc.pkl         + .csv
-  output/bass/extracted_features_chromagram.pkl    + .csv
-  output/bass/extracted_features_mfcc_chroma.pkl   + .csv
-  output/guitar/...
-  output/vocals/...
-  dst.
+Subfolder instrumen yang di‑scan otomatis:
+  input/vocals, input/guitar, input/piano, input/bass, dll.
 
 Cara pakai:
   pip install librosa pandas numpy tqdm
@@ -24,6 +20,7 @@ Cara pakai:
 import os
 import re
 import pickle
+import shutil
 import warnings
 
 import numpy as np
@@ -36,7 +33,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # ───────────────────────────── KONFIGURASI ────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH   = os.path.join(BASE_DIR, "master_dataset_lstm_ready.csv")
+CSV_PATH   = os.path.join(BASE_DIR, "input/base_dataset.csv")
 INPUT_DIR  = os.path.join(BASE_DIR, "input")
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 
@@ -56,26 +53,60 @@ META_COLS = [
 # ─────────────────────── HELPER FUNCTIONS ─────────────────────────────────
 def _build_track_id(title: str, artist: str) -> str:
     """(artist, title) → track_id slug, e.g. 'vierratale-rasa_ini'."""
-    artist_slug = re.sub(r"\s+", "_", artist.strip().lower())
+    # Bersihkan artis: hapus semua simbol dan spasi (misal: ST 12 -> st12, D'Masiv -> dmasiv)
+    artist_slug = re.sub(r"[^a-zA-Z0-9]+", "", artist.lower())
+    # Bersihkan judul: spasi jadi underscore
     title_slug  = re.sub(r"\s+", "_", title.strip().lower())
     return f"{artist_slug}-{title_slug}"
 
 
-def _wav_path(track_id: str, instrument: str) -> str:
-    """track_id + instrument → full path WAV."""
-    return os.path.join(INPUT_DIR, instrument,
-                        f"{track_id}_{instrument}.wav")
+def _wav_path(artist_raw: str, track_id: str, instrument: str) -> str:
+    """artist + track_id + instrument → full path WAV atau MP3."""
+    # 1. Coba folder asli dari CSV
+    # 2. Coba folder lowercase (misal: ST 12 -> st 12)
+    # 3. Coba folder lowercase tanpa spasi (misal: ST 12 -> st12)
+    
+    artist_variations = [
+        artist_raw,
+        artist_raw.lower(),
+        artist_raw.lower().replace(" ", ""),
+        artist_raw.lower().replace("'", ""),
+        artist_raw.lower().replace(" ", "").replace("'", "")
+    ]
+    
+    # Hapus duplikat sambil menjaga urutan
+    seen = set()
+    artist_variations = [v for v in artist_variations if not (v in seen or seen.add(v))]
+
+    for art_folder in artist_variations:
+        base_folder = os.path.join(INPUT_DIR, instrument, art_folder)
+        if not os.path.isdir(base_folder):
+            continue
+
+        # Tentukan pola nama file yang akan dicoba
+        filename_patterns = [f"{track_id}_{instrument}"]
+        if instrument == "raw_audio":
+            filename_patterns.append(track_id) # Coba tanpa suffix _raw_audio
+
+        for pattern in filename_patterns:
+            for ext in [".wav", ".mp3"]:
+                path = os.path.join(base_folder, f"{pattern}{ext}")
+                if os.path.isfile(path):
+                    return path
+    return None
 
 
-def _load_and_cache(track_id: str, instrument: str,
+def _load_and_cache(artist_raw: str, track_id: str, instrument: str,
                     cache: dict) -> np.ndarray | None:
     """Load audio sekali per lagu, simpan ke dict cache."""
     key = f"{track_id}_{instrument}"
     if key in cache:
         return cache[key]
-    path = _wav_path(track_id, instrument)
-    if not os.path.isfile(path):
+    
+    path = _wav_path(artist_raw, track_id, instrument)
+    if path is None:
         return None
+
     y, _ = librosa.load(path, sr=SR)
     cache[key] = y
     return y
@@ -117,7 +148,7 @@ def _parse_end_time(val) -> float:
 def _process_row(row, instrument: str, cache: dict):
     """Proses 1 baris CSV → (y_seg, meta) atau None jika skip."""
     track_id = _build_track_id(row["title"], row["artist"])
-    y_full   = _load_and_cache(track_id, instrument, cache)
+    y_full   = _load_and_cache(row["artist"], track_id, instrument, cache)
     if y_full is None:
         return None
 
@@ -191,17 +222,41 @@ def extract_mfcc_chroma(df: pd.DataFrame, instrument: str) -> pd.DataFrame:
 
 
 # ─────────────────────── SAVE HELPERS ─────────────────────────────────────
-def _save(df: pd.DataFrame, name: str, out_dir: str) -> None:
-    """Simpan DataFrame ke .pkl dan .csv."""
-    os.makedirs(out_dir, exist_ok=True)
-    pkl_path = os.path.join(out_dir, f"{name}.pkl")
-    csv_path = os.path.join(out_dir, f"{name}.csv")
+def _save(df: pd.DataFrame, feature_method: str, instrument: str) -> None:
+    """
+    Simpan DataFrame ke struktur nested:
+    output/artist/artist_name-song_title/instrument/extracted_features_extracted_methods.pkl
+    """
+    if df.empty:
+        return
 
-    with open(pkl_path, "wb") as f:
-        pickle.dump(df, f)
-    df.to_csv(csv_path, index=False)
+    # Group by artist & title untuk memisahkan per lagu
+    grouped = df.groupby(["artist", "title"])
+    
+    for (artist_raw, title), group_df in grouped:
+        track_id = _build_track_id(title, artist_raw)
+        # Gunakan pembersihan yang sama dengan track_id agar folder artist rapi (st12, dmasiv)
+        artist_folder = re.sub(r"[^a-zA-Z0-9]+", "", artist_raw.lower())
+        
+        # Bangun path: output/artist/track_id/instrument/
+        song_out_dir = os.path.join(OUTPUT_DIR, artist_folder, track_id, instrument)
+        os.makedirs(song_out_dir, exist_ok=True)
+        
+        pkl_path = os.path.join(song_out_dir, f"{feature_method}.pkl")
+        csv_path = os.path.join(song_out_dir, f"{feature_method}.csv")
 
-    print(f"    ✅ {name}  →  shape {df.shape}")
+        with open(pkl_path, "wb") as f:
+            pickle.dump(group_df, f)
+        group_df.to_csv(csv_path, index=False)
+
+        # Copy audio source jika belum ada di output (agar satu paket)
+        src_path = _wav_path(artist_raw, track_id, instrument)
+        if src_path:
+            dst_path = os.path.join(song_out_dir, os.path.basename(src_path))
+            if not os.path.exists(dst_path):
+                shutil.copy2(src_path, dst_path)
+
+    print(f"    ✅ {feature_method} saved for {len(grouped)} songs.")
 
 
 def _get_instrument_folders() -> list[str]:
@@ -217,6 +272,7 @@ def _get_instrument_folders() -> list[str]:
 # ─────────────────────── ENTRY POINT ──────────────────────────────────────
 def main() -> None:
     instruments = _get_instrument_folders()
+    # instruments = ["raw_audio"]
 
     print("=" * 60)
     print("  Feature Extraction Pipeline (Multi‑Instrument)")
@@ -229,24 +285,23 @@ def main() -> None:
     print(f"\n📄 Loaded {len(df)} baris dari CSV\n")
 
     for inst in instruments:
-        inst_out = os.path.join(OUTPUT_DIR, inst)
         print(f"\n{'─' * 50}")
         print(f"🎸 Instrument: {inst}")
-        print(f"   Audio dir : input/{inst}/")
-        print(f"   Output dir: output/{inst}/")
+        print(f"   Audio path: input/{inst}/" + "{artist}/{track_id}_" + f"{inst}.wav")
+        print(f"   Output dir: output/" + "{artist_lower}/{track_id}/" + f"{inst}/")
         print(f"{'─' * 50}")
 
         # 1 ─ MFCC only
         df_mfcc = extract_mfcc_only(df, inst)
-        _save(df_mfcc, "extracted_features_mfcc", inst_out)
+        _save(df_mfcc, "extracted_features_mfcc", inst)
 
         # 2 ─ Chromagram only
         df_chroma = extract_chroma_only(df, inst)
-        _save(df_chroma, "extracted_features_chromagram", inst_out)
+        _save(df_chroma, "extracted_features_chromagram", inst)
 
         # 3 ─ MFCC + Chromagram combined
         df_combined = extract_mfcc_chroma(df, inst)
-        _save(df_combined, "extracted_features_mfcc_chroma", inst_out)
+        _save(df_combined, "extracted_features_mfcc_chroma", inst)
 
     print(f"\n🎉 Selesai! Semua fitur untuk {len(instruments)} instrumen berhasil diekstrak.\n")
 
