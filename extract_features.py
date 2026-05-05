@@ -130,8 +130,9 @@ def _extract_mfcc(y_seg: np.ndarray) -> dict:
 
 
 def _extract_chroma(y_seg: np.ndarray) -> dict:
-    """Hitung Chroma STFT → mean & std (24 fitur)."""
-    chroma = librosa.feature.chroma_stft(y=y_seg, sr=SR, n_chroma=N_CHROMA)
+    """Hitung Chroma CQT (Constant-Q Transform) → mean & std (24 fitur)."""
+    # CQT lebih akurat secara musikal dibanding STFT
+    chroma = librosa.feature.chroma_cqt(y=y_seg, sr=SR, n_chroma=N_CHROMA)
     return {
         **{f"chroma_mean_{i}": v for i, v in enumerate(np.mean(chroma, axis=1))},
         **{f"chroma_std_{i}":  v for i, v in enumerate(np.std(chroma,  axis=1))},
